@@ -4,6 +4,8 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker, scoped_session
 from sqlalchemy import create_engine
 import spotipy
+import spotipy.util as util
+import urllib
 import sys
 import pprint
 from flask_httpauth import HTTPBasicAuth
@@ -11,14 +13,15 @@ import json
 from flask_sqlalchemy import SQLAlchemy
 import tempfile
 import os.path
-
-#NEW IMPORTS
 from oauth2client.client import flow_from_clientsecrets
 from oauth2client.client import FlowExchangeError
 import httplib2
 from flask import make_response
 import requests
 
+os.environ['SPOTIPY_CLIENT_ID'] = spotify.get_client_id()
+os.environ['SPOTIPY_CLIENT_SECRET'] = spotify.get_client_secret()
+os.environ['SPOTIPY_REDIRECT_URI'] = spotify.get_redirect_uri()
 auth = HTTPBasicAuth()
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///test.db'
@@ -26,7 +29,8 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 db.create_all()
 
-def test():
+#Refreshes my personal Spotify access token so that I am able to successfully use the different endpoints
+def refresh_access_token():
     h = httplib2.Http()
     headers = {"Content-type":"application/x-www-form-urlencoded",
     "Authorization":"Basic OGQ1MjcyZjlmMDBmNGE0NGJmZmIyZTNjYjEzYzVmM2E6MzhmMTgwYzRhMWVkNGFjMzhmYmI1OGQ3M2JkOGEzNGI="}
@@ -36,15 +40,15 @@ def test():
     content = json.loads(content)
     return content['access_token']
 
-token = test()
+token = refresh_access_token()
 sp = spotipy.Spotify(auth = token)
 
+#Prompt to use a more helpful endpoint
 @app.route('/')
-def helpMessage():
+def help_message():
     return "Please try and access an useful endpoint"
 
-
-
+#Verifies token provided by the user
 @auth.verify_password
 def verify_password(username_or_token, password):
     #Try to see if it's a token first
@@ -58,17 +62,14 @@ def verify_password(username_or_token, password):
     g.user = user
     return True
 
+#Takes user to the sign in page
 @app.route('/clientOAuth')
 def start():
     return render_template('clientOAuth.html')
 
-@app.route('/oauth', methods = ['POST'])
-def login():
-    #STEP 1 - Parse the auth code
-    authcode = '4/25uDaJMoyfGSgm5RIwmht9zMv3mDCl9QOTmThQEtH2M'
-    print("Step 1 - Complete, received auth code %s" % authcode)
-    if len(authcode)>0:
-        #STEP 2 - Exchange for a token
+#Returns token that user can use to access protected resources
+@app.route('/oauth/<path:authcode>', methods = ['POST'])
+def login(authcode):
         try:
             # Upgrade the authorization code into a credentials object
             oauth_flow = flow_from_clientsecrets('client_secrets.json', scope='')
@@ -88,31 +89,8 @@ def login():
         if result.get('error') is not None:
             response = make_response(json.dumps(result.get('error')), 500)
             response.headers['Content-Type'] = 'application/json'
-
-        # # Verify that the access token is used for the intended user.
-        # gplus_id = credentials.id_token['sub']
-        # if result['user_id'] != gplus_id:
-        #     response = make_response(json.dumps("Token's user ID doesn't match given user ID."), 401)
-        #     response.headers['Content-Type'] = 'application/json'
-        #     return response
-
-        # # Verify that the access token is valid for this app.
-        # if result['issued_to'] != CLIENT_ID:
-        #     response = make_response(json.dumps("Token's client ID does not match app's."), 401)
-        #     response.headers['Content-Type'] = 'application/json'
-        #     return response
-
-        # stored_credentials = login_session.get('credentials')
-        # stored_gplus_id = login_session.get('gplus_id')
-        # if stored_credentials is not None and gplus_id == stored_gplus_id:
-        #     response = make_response(json.dumps('Current user is already connected.'), 200)
-        #     response.headers['Content-Type'] = 'application/json'
-        #     return response
         print ("Step 2 Complete! Access Token : %s " % credentials.access_token)
 
-        #STEP 3 - Find User or make a new one
-
-        #Get user info
         h = httplib2.Http()
         userinfo_url =  "https://www.googleapis.com/oauth2/v1/userinfo"
         params = {'access_token': credentials.access_token, 'alt':'json'}
@@ -124,74 +102,166 @@ def login():
         picture = data['picture']
         email = data['email']
 
-
-
-        #see if user exists, if it doesn't make a new one
         user = db.session.query(User).filter_by(email=email).first()
         if not user:
             user = User(username = name, picture = picture, email = email)
             db.session.add(user)
             db.session.commit()
 
-
-
-        #STEP 4 - Make token
         token = user.generate_auth_token(600)
-
-
-
-        #STEP 5 - Send back token to the client
         return jsonify({'token': token.decode('ascii')})
 
-        #return jsonify({'token': token.decode('ascii'), 'duration': 600})
-    else:
-        return 'Unrecoginized Provider'
+#Gets information on artist passed into the method as the name variable
+@app.route('/getArtistInfo/<name>')
+def displayArtist(name):
+    result = sp.search(name, type = 'artist')
+    uri = result['artists']['items'][0]['uri']
+    artist = sp.artist(uri)
+    popularity = artist['popularity']
+    genre_list = artist['genres']
+    top_tracks = sp.artist_top_tracks(uri)
+    song_list = []
+    cnt = 0
+    for song in top_tracks['tracks']:
+        song_list.append(song['name'])
+        cnt+=1
+        if cnt == 5:
+            break
+    return jsonify({'popularity' : popularity, 'genre_list' : genre_list, 'top_songs' : song_list })
 
-@app.route('/getArtistName/<uri>')
-@auth.login_required
-def displayArtist(uri):
-    result = sp.artist(uri)
-    artist = result['name']
-    return jsonify(name = artist)
-
+#Gets related artists of the artist passed into the method as the query variable
 @app.route('/getRelatedArtists/<query>')
-@auth.login_required
-def displayRelatedArtists(query):
-
+def display_related_artists(query):
     result = sp.search(query, type = 'artist')
     uri = result['artists']['items'][0]['uri']
-    secondResult = sp.artist_related_artists(uri)
-    relatedArtistsList = secondResult['artists']
-    artistList = [{}]
-    for artist in relatedArtistsList:
-        artistList.append({'artist':artist['name'], 'genre':artist['genres'][0]})
-    artistList.pop(0)
-    return jsonify(artistList)
+    second_result = sp.artist_related_artists(uri)
+    related_artists_list = second_result['artists']
+    artist_list = [{}]
+    for artist in related_artists_list:
+        artist_list.append({'artist':artist['name'], 'genre':artist['genres'][0]})
+    artist_list.pop(0)
+    return jsonify(artist_list)
 
+#Gets top albums of the artist passed into the method as the query variable
 @app.route('/getAlbums/<query>')
 @auth.login_required
-def displayAlbums(query):
+def display_albums(query):
     result = sp.search(query, type = 'artist')
     uri = result['artists']['items'][0]['uri']
-    secondResult = sp.artist_albums(uri, 'album')
-    itemsList = secondResult['items']
-    artistsList = []
-    albumList = [{}]
-    for album in itemsList:
+    second_result = sp.artist_albums(uri, 'album')
+    items_list = second_result['items']
+    artists_list = []
+    album_list = [{}]
+    for album in items_list:
         for artist in album['artists']:
-            artistsList.append(artist['name'])
-        albumList.append({'name' : album['name'], 'artists' : artistsList})
-        artistsList = []
-    albumList.pop(0)
-    return jsonify(albumList)
+            artists_list.append(artist['name'])
+        album_list.append({'name' : album['name'], 'artists' : artists_list})
+        artists_list = []
+    album_list.pop(0)
+    return jsonify(album_list)
 
+#Gets audio information on song name passed int as the query variabel
 @app.route('/getAudio/<query>')
 @auth.login_required
-def getAudioAnalysis(query):
+def get_audio_analysis(query):
     result = sp.search(query, type = 'track')
     uri = result['tracks']['items'][0]['uri']
-    secondResult = sp.audio_analysis(uri)
-    return jsonify(secondResult)
+    second_result = sp.audio_analysis(uri)
+    return jsonify(second_result)
+
+#Gets information on the current user
+@app.route('/getCurrentUser')
+def get_user():
+    result = sp.current_user()
+    user_name = result['display_name']
+    followers = result['followers']['total']
+    picture = result['images'][0]['url']
+    uri = result['uri']
+    return jsonify({'user_name: ' : user_name, 'followers: ' : followers, 'picture: ' : picture, 'uri: ' : uri})
+
+#Creates playliist based on playlist_name
+@app.route('/addPlaylist/<playlist_name>', methods=['POST'])
+def add_playlist(playlist_name):
+    uri = sp.current_user()['uri']
+    index = uri.index("user:")
+    ID = uri[index+5:]
+    scope = 'playlist-modify-public'
+    token_new = util.prompt_for_user_token(ID, scope)
+    sp_new = spotipy.Spotify(auth=token_new)
+    result = sp_new.user_playlist_create(ID,playlist_name, public =True)
+    return "Successfully created a playlist named %s" % (playlist_name)
+
+#Adds or deletes songs in a playlist based on the request. playlist_id must be an id and song_list must be a list
+#of song names.
+@app.route('/alterSongsInPlaylist/<playlist_id>/<song_list>', methods=['POST','DELETE'])
+def alter_songs_in_playlist(playlist_id,song_list ):
+    uri = sp.current_user()['uri']
+    index = uri.index("user:")
+    ID = uri[index+5:]
+    if request.method == 'POST':
+        if "," not in song_list:
+            result = sp.search(song_list, type= 'track')
+            track_uri = result['tracks']['items'][0]['uri']
+            track_uri_list =[track_uri]
+            results = sp.user_playlist_add_tracks(ID, playlist_id, track_uri_list)
+            return "Successfully added %s" % song_list
+        else:
+            list_of_songs = song_list.split(",")
+            list_of_track_uris=[]
+            for song in list_of_songs:
+                result = sp.search(song, type= 'track')
+                track_uri = result['tracks']['items'][0]['uri']
+                list_of_track_uris.append(track_uri)
+            results = sp.user_playlist_add_tracks(ID, playlist_id, list_of_track_uris)
+            return "Successfully added songs to playlist"
+    if request.method == 'DELETE':
+        if "," not in song_list:
+            result = sp.search(song_list, type= 'track')
+            track_uri = result['tracks']['items'][0]['uri']
+            track_uri_list =[track_uri]
+            results = sp.user_playlist_remove_all_occurrences_of_tracks(ID, playlist_id, track_uri_list)
+            return "Successfully deleted %s" % song_list
+        else:
+            list_of_songs = song_list.split(",")
+            list_of_track_uris=[]
+            for song in list_of_songs:
+                result = sp.search(song, type= 'track')
+                track_uri = result['tracks']['items'][0]['uri']
+                list_of_track_uris.append(track_uri)
+            results = sp.user_playlist_remove_all_occurrences_of_tracks(ID, playlist_id, list_of_track_uris)
+            return "Successfully deleted songs from playlist"
+
+#On a put request, the method will update the playist with the given name. On a delete request, it will delete the
+#playlist.playlist_id must be an id and new_name can be any string.
+@app.route('/updatePlaylist/<playlist_id>/<new_name>', methods=['PUT', "DELETE"])
+def update_playlist(playlist_id,new_name ):
+    uri = sp.current_user()['uri']
+    index = uri.index("user:")
+    ID = uri[index+5:]
+    if request.method == 'PUT':
+        sp.user_playlist_change_details(ID, playlist_id, name = new_name)
+        return "Successfully updated name of playlist to %s" % new_name
+    if request.method == 'DELETE':
+        sp.user_playlist_unfollow(ID, playlist_id)
+        return "Successfully deleted playlist"
+
+#Returns a boolean based on whether or not the song is in the playlist_id.
+#Both playlist_id and song_id must be ids provided by Spotify
+@app.route('/isSongInPlaylist/<playlist_id>/<song_id>')
+def is_song_in_playlist(playlist_id, song_id):
+    uri = sp.current_user()['uri']
+    index = uri.index("user:")
+    ID = uri[index+5:]
+    result = sp.user_playlist_tracks(ID, playlist_id)
+    track_list= result['items']
+    track_list_uri = []
+    for track in track_list:
+        track_list_uri.append(track['track']['uri'])
+    for uri in track_list_uri:
+        if song_id in uri:
+            return jsonify({'is_in_playlist': True})
+    return jsonify({'is_in_playlist': False})
+
 
 
 if __name__ == '__main__':
